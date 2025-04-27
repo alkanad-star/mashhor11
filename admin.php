@@ -216,18 +216,8 @@ if (isset($_POST['edit_user'])) {
                                            ? "تمت إضافة $" . number_format($transaction_amount, 2) . " إلى رصيدك بواسطة الإدارة."
                                            : "تم خصم $" . number_format($transaction_amount, 2) . " من رصيدك بواسطة الإدارة.";
                     
-                    // Check if notifications table exists
-                    $check_table_query = "SHOW TABLES LIKE 'notifications'";
-                    $table_exists = $conn->query($check_table_query)->num_rows > 0;
-                    
-                    if ($table_exists) {
-                        $insert_notification_query = "INSERT INTO notifications (user_id, title, message, icon) 
-                                                    VALUES (?, ?, ?, ?)";
-                        $icon = $balance_diff > 0 ? "fas fa-wallet" : "fas fa-money-bill-wave";
-                        $stmt = $conn->prepare($insert_notification_query);
-                        $stmt->bind_param("isss", $user_id, $notification_title, $notification_message, $icon);
-                        $stmt->execute();
-                    }
+                    // Use notification utility function
+                    send_notification($user_id, $notification_title, $notification_message, 'payment', 'fas fa-wallet');
                 }
             }
             
@@ -277,17 +267,8 @@ if (isset($_POST['toggle_user_status'])) {
                               : "تم تعليق حسابك. يرجى التواصل مع الدعم الفني لمزيد من المعلومات.";
         $icon = $new_status == 1 ? "fas fa-check-circle" : "fas fa-ban";
         
-        // Check if notifications table exists
-        $check_table_query = "SHOW TABLES LIKE 'notifications'";
-        $table_exists = $conn->query($check_table_query)->num_rows > 0;
-        
-        if ($table_exists) {
-            $insert_notification_query = "INSERT INTO notifications (user_id, title, message, icon) 
-                                        VALUES (?, ?, ?, ?)";
-            $stmt = $conn->prepare($insert_notification_query);
-            $stmt->bind_param("isss", $user_id, $notification_title, $notification_message, $icon);
-            $stmt->execute();
-        }
+        // Use notification function
+        send_notification($user_id, $notification_title, $notification_message, 'system', $icon);
         
         $success_message = $new_status == 1 
                          ? "تم تفعيل المستخدم بنجاح." 
@@ -306,6 +287,7 @@ if (isset($_POST['update_order_status'])) {
     $order_id = filter_input(INPUT_POST, 'order_id', FILTER_SANITIZE_NUMBER_INT);
     $new_status = filter_input(INPUT_POST, 'status', FILTER_SANITIZE_STRING);
     $remains = isset($_POST['remains']) ? filter_input(INPUT_POST, 'remains', FILTER_SANITIZE_NUMBER_INT) : 0;
+    $start_count = isset($_POST['start_count']) ? filter_input(INPUT_POST, 'start_count', FILTER_SANITIZE_NUMBER_INT) : null;
     
     // Get current order
     $order_query = "SELECT * FROM orders WHERE id = ?";
@@ -319,10 +301,17 @@ if (isset($_POST['update_order_status'])) {
         $conn->begin_transaction();
         
         try {
-            // Update order status
-            $update_query = "UPDATE orders SET status = ?, remains = ? WHERE id = ?";
-            $stmt = $conn->prepare($update_query);
-            $stmt->bind_param("sii", $new_status, $remains, $order_id);
+            // If starting processing, update the start_count
+            if ($new_status === 'processing' && $start_count !== null) {
+                $update_query = "UPDATE orders SET status = ?, start_count = ?, remains = ? WHERE id = ?";
+                $stmt = $conn->prepare($update_query);
+                $stmt->bind_param("siii", $new_status, $start_count, $remains, $order_id);
+            } else {
+                // Update order status
+                $update_query = "UPDATE orders SET status = ?, remains = ?, updated_at = NOW() WHERE id = ?";
+                $stmt = $conn->prepare($update_query);
+                $stmt->bind_param("sii", $new_status, $remains, $order_id);
+            }
             $stmt->execute();
             
             // If status is completed, update spent and in_use in a single query
@@ -357,6 +346,27 @@ if (isset($_POST['update_order_status'])) {
                 $stmt->bind_param("ids", $order['user_id'], $order['amount'], $description);
                 $stmt->execute();
             }
+            // For failed orders
+            else if ($new_status === 'failed' && $order['status'] !== 'failed') {
+                // Similar to cancelled, release in_use balance
+                $update_balance_query = "UPDATE users SET in_use = in_use - ? WHERE id = ?";
+                $stmt = $conn->prepare($update_balance_query);
+                $stmt->bind_param("di", $order['amount'], $order['user_id']);
+                $stmt->execute();
+                
+                // Refund amount to user balance
+                $refund_query = "UPDATE users SET balance = balance + ? WHERE id = ?";
+                $stmt = $conn->prepare($refund_query);
+                $stmt->bind_param("di", $order['amount'], $order['user_id']);
+                $stmt->execute();
+                
+                // Create refund transaction
+                $description = "استرداد المبلغ لفشل الطلب #" . $order_id;
+                $insert_transaction_query = "INSERT INTO transactions (user_id, amount, type, status, description) VALUES (?, ?, 'refund', 'completed', ?)";
+                $stmt = $conn->prepare($insert_transaction_query);
+                $stmt->bind_param("ids", $order['user_id'], $order['amount'], $description);
+                $stmt->execute();
+            }
             
             // For partial delivery, adjust remaining balance
             if ($new_status === 'partial' && $order['status'] !== 'partial') {
@@ -368,6 +378,12 @@ if (isset($_POST['update_order_status'])) {
                 $update_inuse_query = "UPDATE users SET in_use = in_use - ? WHERE id = ?";
                 $stmt = $conn->prepare($update_inuse_query);
                 $stmt->bind_param("di", $order['amount'], $order['user_id']);
+                $stmt->execute();
+                
+                // Add the used amount to spent
+                $update_spent_query = "UPDATE users SET spent = spent + ? WHERE id = ?";
+                $stmt = $conn->prepare($update_spent_query);
+                $stmt->bind_param("di", $used_amount, $order['user_id']);
                 $stmt->execute();
                 
                 // Refund the unused amount
@@ -382,6 +398,22 @@ if (isset($_POST['update_order_status'])) {
                 $stmt = $conn->prepare($insert_transaction_query);
                 $stmt->bind_param("ids", $order['user_id'], $refund_amount, $description);
                 $stmt->execute();
+            }
+            
+            // Record status change in order history table
+            if ($new_status !== $order['status']) {
+                $insert_history_query = "INSERT INTO order_history 
+                    (order_id, old_status, new_status, changed_by, changed_at, notes) 
+                    VALUES (?, ?, ?, ?, NOW(), ?)";
+                $admin_id = isset($_SESSION['admin_id']) ? $_SESSION['admin_id'] : 'system';
+                $notes = "تم تحديث الحالة بواسطة المدير";
+                
+                $stmt = $conn->prepare($insert_history_query);
+                $stmt->bind_param("issss", $order_id, $order['status'], $new_status, $admin_id, $notes);
+                $stmt->execute();
+                
+                // Send notification to user about status change
+                send_order_notification($order['user_id'], $order_id, $new_status);
             }
             
             $conn->commit();
@@ -520,78 +552,6 @@ if (isset($_POST['add_funds'])) {
         }
     } else {
         $error_message = "الرجاء التأكد من صحة البيانات المدخلة.";
-    }
-}
-
-// Process sending notification
-if (isset($_POST['send_notification'])) {
-    $target_users = filter_input(INPUT_POST, 'target_users', FILTER_SANITIZE_STRING);
-    $title = filter_input(INPUT_POST, 'title', FILTER_SANITIZE_STRING);
-    $message = filter_input(INPUT_POST, 'message', FILTER_SANITIZE_STRING);
-    $icon = filter_input(INPUT_POST, 'icon', FILTER_SANITIZE_STRING) ?: 'fas fa-bell';
-    $action_url = filter_input(INPUT_POST, 'action_url', FILTER_SANITIZE_STRING);
-    $notification_type = filter_input(INPUT_POST, 'notification_type', FILTER_SANITIZE_STRING) ?: 'general';
-    
-    if ($title && $message) {
-        // Check if notifications table exists
-        $check_table_query = "SHOW TABLES LIKE 'notifications'";
-        $table_exists = $conn->query($check_table_query)->num_rows > 0;
-        
-        if (!$table_exists) {
-            // Create notifications table
-            $create_table_query = "CREATE TABLE notifications (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NULL,
-                title VARCHAR(255) NOT NULL,
-                message TEXT NOT NULL,
-                icon VARCHAR(50) DEFAULT 'fas fa-bell',
-                notification_type VARCHAR(50) DEFAULT 'general',
-                action_url VARCHAR(255) DEFAULT NULL,
-                is_read BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            )";
-            $conn->query($create_table_query);
-        }
-        
-        // Start transaction
-        $conn->begin_transaction();
-        
-        try {
-            if ($target_users === 'all') {
-                // Send to all users
-                $users_query = "SELECT id FROM users";
-                $users = $conn->query($users_query);
-                
-                while ($user = $users->fetch_assoc()) {
-                    $insert_query = "INSERT INTO notifications (user_id, title, message, icon, notification_type, action_url) VALUES (?, ?, ?, ?, ?, ?)";
-                    $stmt = $conn->prepare($insert_query);
-                    $stmt->bind_param("isssss", $user['id'], $title, $message, $icon, $notification_type, $action_url);
-                    $stmt->execute();
-                }
-            } else if ($target_users === 'specific' && isset($_POST['user_id'])) {
-                // Send to specific user
-                $user_id = filter_input(INPUT_POST, 'user_id', FILTER_SANITIZE_NUMBER_INT);
-                $insert_query = "INSERT INTO notifications (user_id, title, message, icon, notification_type, action_url) VALUES (?, ?, ?, ?, ?, ?)";
-                $stmt = $conn->prepare($insert_query);
-                $stmt->bind_param("isssss", $user_id, $title, $message, $icon, $notification_type, $action_url);
-                $stmt->execute();
-            } else {
-                // Send global notification (user_id = NULL)
-                $insert_query = "INSERT INTO notifications (user_id, title, message, icon, notification_type, action_url) VALUES (NULL, ?, ?, ?, ?, ?)";
-                $stmt = $conn->prepare($insert_query);
-                $stmt->bind_param("sssss", $title, $message, $icon, $notification_type, $action_url);
-                $stmt->execute();
-            }
-            
-            $conn->commit();
-            $success_message = "تم إرسال الإشعار بنجاح.";
-        } catch (Exception $e) {
-            $conn->rollback();
-            $error_message = "حدث خطأ أثناء إرسال الإشعار: " . $e->getMessage();
-        }
-    } else {
-        $error_message = "الرجاء إدخال عنوان ونص الإشعار.";
     }
 }
 
