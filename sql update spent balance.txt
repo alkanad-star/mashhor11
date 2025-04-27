@@ -1,0 +1,2 @@
+UPDATE users u
+SET spent = (SELECT COALESCE(SUM(amount), 0) FROM orders WHERE user_id = u.id AND status = 'completed')

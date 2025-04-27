@@ -1,0 +1,14 @@
+# 1. turn off Apache’s MultiViews (so it won’t try to match other extensions for you)
+Options -MultiViews
+
+# 2. make sure mod_rewrite is running
+RewriteEngine On
+
+# 3. if requested URL isn’t a file…
+RewriteCond %{REQUEST_FILENAME} !-f
+# 4. and isn’t a directory…
+RewriteCond %{REQUEST_FILENAME} !-d
+# 5. but adding “.php” makes a real file…
+RewriteCond %{REQUEST_FILENAME}.php -f
+# 6. internally rewrite “/something” ⇒ “/something.php”
+RewriteRule ^(.+)$ $1.php [L,QSA]
